@@ -132,7 +132,7 @@ def run():
         # 5. 逐一報名所有符合條件的歡樂場次 (+2 人)
         if target_registrations:
             payload = {
-                "displayName": "Luke",
+                "displayName": "Victor",
                 "needsPaddle": False,
                 "count": 2
             }
