@@ -1,4 +1,5 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from threading import Barrier, Event, Lock
 from unittest.mock import MagicMock, patch
@@ -177,6 +178,123 @@ class BotTests(unittest.TestCase):
         with patch.object(bot, "poll_date", side_effect=poll):
             bot.poll_dates([f"2026-09-{day}" for day in range(23, 29)], [], {})
         self.assertEqual(peak, 3)
+
+    def test_countdown_triggers_prefetch_only_once(self):
+        prefetch = MagicMock()
+        times = [
+            datetime(2026, 9, 22, 11, 59, 28),
+            datetime(2026, 9, 22, 11, 59, 29),
+            datetime(2026, 9, 22, 11, 59, 30),
+            datetime(2026, 9, 22, 11, 59, 30, 500000),
+            datetime(2026, 9, 22, 11, 59, 59),
+            datetime(2026, 9, 22, 12),
+        ]
+        with patch.object(bot, "datetime") as clock:
+            clock.now.side_effect = times
+            prefetch.side_effect = lambda: self.assertEqual(clock.now.call_count, 3)
+            bot.wait_until_target_time(on_prefetch=prefetch)
+        prefetch.assert_called_once_with()
+
+    def test_cached_result_waits_for_noon_and_checks_once_after_post(self):
+        gate = Event()
+        waiting = Event()
+        real_wait = gate.wait
+
+        def wait():
+            waiting.set()
+            return real_wait()
+
+        self.session.get.side_effect = [response([event()]), response([event(), event("new")])]
+        with patch.object(gate, "wait", side_effect=wait), ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(bot.poll_date, "2026-09-27", [], {}, set(), Lock(), gate)
+            try:
+                self.assertTrue(waiting.wait(3))
+                self.assertEqual(self.session.get.call_count, 1)
+                self.session.post.assert_not_called()
+            finally:
+                gate.set()
+            future.result(timeout=3)
+        self.assertEqual(self.session.get.call_count, 2)
+        self.assertEqual(self.session.post.call_count, 2)
+
+    def test_empty_or_failed_prefetch_has_two_followup_queries(self):
+        for first in (response([]), requests.Timeout()):
+            with self.subTest(first=first):
+                self.session.reset_mock()
+                gate = Event()
+                gate.set()
+                self.session.get.side_effect = [first, response([event()]), response([event()])]
+                bot.poll_date("2026-09-27", [], {}, set(), Lock(), gate)
+                self.assertEqual(self.session.get.call_count, 3)
+                self.session.post.assert_called_once()
+
+    def test_slow_prefetch_does_not_block_countdown_or_fast_date_post(self):
+        slow_started = Event()
+        fast_started = Event()
+        fast_posted = Event()
+
+        def make_session():
+            session = MagicMock()
+            session.__enter__.return_value = session
+
+            def get(url, **kwargs):
+                if "2026-09-27" in url:
+                    slow_started.set()
+                    if not fast_posted.wait(3):
+                        raise AssertionError("慢 GET 阻塞了開搶訊號或另一日 POST")
+                    return response([event("slow")])
+                fast_started.set()
+                return response([event("fast")])
+
+            def post(url, **kwargs):
+                if "/fast/" in url:
+                    fast_posted.set()
+                return response(status=201)
+
+            session.get.side_effect = get
+            session.post.side_effect = post
+            return session
+
+        def countdown(on_prefetch):
+            on_prefetch()
+            self.assertTrue(slow_started.wait(3))
+            self.assertTrue(fast_started.wait(3))
+            self.assertFalse(fast_posted.is_set())
+            on_prefetch()  # 即使 callback 被重複呼叫，也不可重複提交。
+
+        self.session_factory.side_effect = make_session
+        with patch.object(bot, "wait_until_target_time", side_effect=countdown):
+            attempted = bot.poll_dates(["2026-09-27", "2026-09-28"], [], {}, wait_for_noon=True)
+        self.assertEqual(attempted, {("slow", "fun-1"), ("fast", "fun-1")})
+        self.assertEqual(self.session_factory.call_count, 2)
+
+    def test_late_start_uses_original_three_queries(self):
+        self.session.get.return_value = response([event()])
+        with patch.object(bot, "datetime") as clock:
+            clock.now.return_value = datetime(2026, 9, 22, 12, 0, 1)
+            bot.poll_dates(["2026-09-27"], [], {}, wait_for_noon=True)
+        self.assertEqual(self.session.get.call_count, 3)
+        self.session.post.assert_called_once()
+
+    def test_skipped_prefetch_window_uses_original_queries(self):
+        self.session.get.return_value = response([event()])
+        with patch.object(bot, "datetime") as clock:
+            clock.now.side_effect = [datetime(2026, 9, 22, 11, 59, 29), datetime(2026, 9, 22, 12)]
+            bot.poll_dates(["2026-09-27"], [], {}, wait_for_noon=True)
+        self.assertEqual(self.session.get.call_count, 3)
+        self.session.post.assert_called_once()
+
+    def test_interrupted_countdown_releases_workers_without_post(self):
+        self.session.get.return_value = response([event()])
+
+        def countdown(on_prefetch):
+            on_prefetch()
+            raise RuntimeError("倒數中斷")
+
+        with patch.object(bot, "wait_until_target_time", side_effect=countdown):
+            with self.assertRaisesRegex(RuntimeError, "倒數中斷"):
+                bot.poll_dates(["2026-09-27"], [], {}, wait_for_noon=True)
+        self.session.post.assert_not_called()
 
 
 if __name__ == "__main__":

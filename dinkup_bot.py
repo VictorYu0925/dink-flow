@@ -3,7 +3,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from threading import Lock
+from threading import Event, Lock
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -13,6 +13,7 @@ TARGET_LOCATION_KEYWORDS = ("松",)
 MAX_EVENT_FETCH_ATTEMPTS = 3
 API_RETRY_DELAY_SECONDS = 1
 MAX_DATE_WORKERS = 3
+PREFETCH_SECONDS = 30
 
 
 def get_target_day_offsets():
@@ -32,7 +33,7 @@ def get_target_dates(day_offsets, now=None):
     return [(today + timedelta(days=offset)).isoformat() for offset in day_offsets]
 
 
-def wait_until_target_time(target_hour=12, target_minute=0, target_second=0):
+def wait_until_target_time(target_hour=12, target_minute=0, target_second=0, on_prefetch=None):
     """毫秒級倒數等待至 12:00:00"""
     now = datetime.now()
     target_time = now.replace(hour=target_hour, minute=target_minute, second=target_second, microsecond=0)
@@ -42,13 +43,17 @@ def wait_until_target_time(target_hour=12, target_minute=0, target_second=0):
         return
 
     print(f"⏳ 當前時間：{now.strftime('%H:%M:%S')}，毫秒級預熱倒數中...")
+    prefetch_started = False
     while True:
         now = datetime.now()
         remaining = (target_time - now).total_seconds()
         if remaining <= 0:
             print("\n🚀 12:00:00 到達！啟動 API 搶報！")
             break
-        elif remaining > 2:
+        if remaining <= PREFETCH_SECONDS and not prefetch_started and on_prefetch is not None:
+            prefetch_started = True
+            on_prefetch()  # 只提交背景工作，不等待 GET 結果。
+        if remaining > 2:
             time.sleep(0.5)
         else:
             time.sleep(0.001)
@@ -110,7 +115,7 @@ def register_once(session, headers, registration, attempted, lock, target_date):
         print(f"⚠️ [{target_date}] 報名結果不明，不自動重送，請確認網站報名狀態：{exc}")
 
 
-def poll_date(target_date, cookies, headers, attempted, lock):
+def poll_date(target_date, cookies, headers, attempted, lock, start_event=None, cancelled=None):
     # 每個日期使用自己的 Session，避免執行緒共用可變的 cookie / 連線狀態。
     with requests.Session() as session:
         for cookie in cookies:
@@ -118,6 +123,7 @@ def poll_date(target_date, cookies, headers, attempted, lock):
                 cookie["name"], cookie["value"], domain=cookie["domain"], path=cookie["path"]
             )
         events_url = f"https://dinkup.club/api/events?club=xinyi&date={target_date}"
+        max_attempts = MAX_EVENT_FETCH_ATTEMPTS
         for attempt in range(1, MAX_EVENT_FETCH_ATTEMPTS + 1):
             registrations = []
             try:
@@ -130,24 +136,60 @@ def poll_date(target_date, cookies, headers, attempted, lock):
             except (AttributeError, TypeError, ValueError):
                 print(f"⚠️ [{target_date}] API 回應格式無法處理。")
 
-            # 找到就報名，不等待其他日期；完成報名後仍查詢，捕捉同日稍晚上架的場次。
+            if attempt == 1 and start_event is not None:
+                # 預查只有一次；結果留在此工作中，沿用同一個 Session 報名。
+                if registrations:
+                    max_attempts = 2  # 有快取：報名後僅補查一次。
+                start_event.wait()
+                if cancelled is not None and cancelled.is_set():
+                    return
+
+            # 必須等到開搶；慢日期的 GET 不影響其他日期送出 POST。
             for registration in registrations:
                 register_once(session, headers, registration, attempted, lock, target_date)
-            if attempt < MAX_EVENT_FETCH_ATTEMPTS:
+            if attempt >= max_attempts:
+                break
+            # 預查空值或失敗，中午立即補查，不再額外等待一秒。
+            if not (attempt == 1 and start_event is not None and not registrations):
                 time.sleep(API_RETRY_DELAY_SECONDS)
 
 
-def poll_dates(target_dates, cookies, headers):
+def poll_dates(target_dates, cookies, headers, wait_for_noon=False):
     target_dates = list(dict.fromkeys(target_dates))
     attempted = set()
     lock = Lock()
     if not target_dates:
         return attempted
     with ThreadPoolExecutor(max_workers=min(MAX_DATE_WORKERS, len(target_dates))) as executor:
-        futures = [
-            executor.submit(poll_date, target_date, cookies, headers, attempted, lock)
-            for target_date in target_dates
-        ]
+        futures = []
+        start_event = Event()
+        cancelled = Event()
+
+        def start_prefetch():
+            if not futures:
+                futures.extend(
+                    executor.submit(
+                        poll_date, target_date, cookies, headers, attempted, lock,
+                        start_event, cancelled,
+                    )
+                    for target_date in target_dates
+                )
+
+        if wait_for_noon:
+            try:
+                wait_until_target_time(on_prefetch=start_prefetch)
+            except BaseException:
+                # 中斷倒數時釋放等待中的工作，但禁止提前報名。
+                cancelled.set()
+                raise
+            finally:
+                start_event.set()
+        if not futures:
+            # 晚啟動或時鐘跨過預查窗口：直接走原本三輪查詢流程。
+            futures = [
+                executor.submit(poll_date, target_date, cookies, headers, attempted, lock)
+                for target_date in target_dates
+            ]
         for future in as_completed(futures):
             future.result()
     if not attempted:
@@ -177,10 +219,9 @@ def run():
                 "Origin": "https://dinkup.club",
                 "Referer": "https://dinkup.club/xinyi",
             }
-            wait_until_target_time(12, 0, 0)
             target_dates = get_target_dates(day_offsets)
             print(f"🎯 目標預約日期：{', '.join(target_dates)}")
-            poll_dates(target_dates, cookies, headers)
+            poll_dates(target_dates, cookies, headers, wait_for_noon=True)
         finally:
             browser.close()
 
