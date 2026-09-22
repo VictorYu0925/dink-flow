@@ -14,6 +14,8 @@ MAX_EVENT_FETCH_ATTEMPTS = 3
 API_RETRY_DELAY_SECONDS = 1
 MAX_DATE_WORKERS = 3
 PREFETCH_SECONDS = 30
+PREFETCH_GET_TIMEOUT = (5, 15)  # 連線、讀取等待秒數；不是整個請求的總時限。
+EVENT_GET_TIMEOUT = (5, 10)
 
 
 def get_target_day_offsets():
@@ -60,7 +62,7 @@ def wait_until_target_time(target_hour=12, target_minute=0, target_second=0, on_
 
 
 def select_registrations(data):
-    events = data if isinstance(data, list) else data.get("events", [])
+    events = data if isinstance(data, list) else data["events"]
     if not isinstance(events, list):
         raise ValueError("活動清單不是陣列")
     registrations = []
@@ -124,17 +126,26 @@ def poll_date(target_date, cookies, headers, attempted, lock, start_event=None, 
             )
         events_url = f"https://dinkup.club/api/events?club=xinyi&date={target_date}"
         max_attempts = MAX_EVENT_FETCH_ATTEMPTS
+        successful_queries = 0
         for attempt in range(1, MAX_EVENT_FETCH_ATTEMPTS + 1):
             registrations = []
+            is_prefetch = attempt == 1 and start_event is not None and not start_event.is_set()
+            timeout = PREFETCH_GET_TIMEOUT if is_prefetch else EVENT_GET_TIMEOUT
+            phase = "預查" if is_prefetch else "查詢"
+            started = time.monotonic()
+            label = f"[{target_date}] {phase} GET {attempt}/{max_attempts}"
+            print(f"🔎 {datetime.now():%H:%M:%S} {label} 開始，connect/read timeout={timeout}")
             try:
-                response = session.get(events_url, headers=headers, timeout=2)
-                print(f"🔎 [{target_date}] GET {attempt}/{MAX_EVENT_FETCH_ATTEMPTS}：HTTP {response.status_code}")
+                response = session.get(events_url, headers=headers, timeout=timeout)
+                print(f"🔎 {label}：HTTP {response.status_code}，耗時 {time.monotonic() - started:.2f}s")
                 if response.status_code == 200:
                     registrations = select_registrations(response.json())
+                    successful_queries += 1
+                    print(f"📋 {label}：符合場次 {len(registrations)} 個")
             except requests.RequestException as exc:
-                print(f"⚠️ [{target_date}] 查詢失敗：{exc}")
-            except (AttributeError, TypeError, ValueError):
-                print(f"⚠️ [{target_date}] API 回應格式無法處理。")
+                print(f"⚠️ {label} 耗時 {time.monotonic() - started:.2f}s，{type(exc).__name__}：{exc}")
+            except (AttributeError, KeyError, TypeError, ValueError):
+                print(f"⚠️ {label} API 回應格式無法處理。")
 
             if attempt == 1 and start_event is not None:
                 # 預查只有一次；結果留在此工作中，沿用同一個 Session 報名。
@@ -152,6 +163,11 @@ def poll_date(target_date, cookies, headers, attempted, lock, start_event=None, 
             # 預查空值或失敗，中午立即補查，不再額外等待一秒。
             if not (attempt == 1 and start_event is not None and not registrations):
                 time.sleep(API_RETRY_DELAY_SECONDS)
+        if successful_queries == 0:
+            print(f"❌ [{target_date}] 所有查詢均失敗，無法判定是否有可報名場次。")
+        elif successful_queries < max_attempts:
+            print(f"⚠️ [{target_date}] 僅 {successful_queries}/{max_attempts} 次取得有效資料，查詢結果可能不完整。")
+        return successful_queries > 0
 
 
 def poll_dates(target_dates, cookies, headers, wait_for_noon=False):
@@ -190,8 +206,13 @@ def poll_dates(target_dates, cookies, headers, wait_for_noon=False):
                 executor.submit(poll_date, target_date, cookies, headers, attempted, lock)
                 for target_date in target_dates
             ]
+        future_dates = dict(zip(futures, target_dates))
+        failed_dates = []
         for future in as_completed(futures):
-            future.result()
+            if future.result() is False:
+                failed_dates.append(future_dates[future])
+    if failed_dates:
+        raise RuntimeError(f"以下日期未取得任何有效活動資料，請檢查查詢日誌：{', '.join(sorted(failed_dates))}")
     if not attempted:
         print("❌ 未找到符合松山/西松場地的歡樂分組。")
     return attempted

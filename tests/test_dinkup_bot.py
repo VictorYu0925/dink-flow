@@ -33,7 +33,7 @@ class BotTests(unittest.TestCase):
         self.session = self.session_factory.return_value.__enter__.return_value
         self.session.post.return_value = response(status=201)
         self.enterContext(patch.object(bot.time, "sleep"))
-        self.enterContext(patch("builtins.print"))
+        self.log = self.enterContext(patch("builtins.print"))
 
     def poll(self):
         attempted = set()
@@ -210,11 +210,13 @@ class BotTests(unittest.TestCase):
             try:
                 self.assertTrue(waiting.wait(3))
                 self.assertEqual(self.session.get.call_count, 1)
+                self.assertEqual(self.session.get.call_args.kwargs["timeout"], (5, 15))
                 self.session.post.assert_not_called()
             finally:
                 gate.set()
             future.result(timeout=3)
         self.assertEqual(self.session.get.call_count, 2)
+        self.assertEqual(self.session.get.call_args.kwargs["timeout"], (5, 10))
         self.assertEqual(self.session.post.call_count, 2)
 
     def test_empty_or_failed_prefetch_has_two_followup_queries(self):
@@ -279,7 +281,7 @@ class BotTests(unittest.TestCase):
     def test_skipped_prefetch_window_uses_original_queries(self):
         self.session.get.return_value = response([event()])
         with patch.object(bot, "datetime") as clock:
-            clock.now.side_effect = [datetime(2026, 9, 22, 11, 59, 29), datetime(2026, 9, 22, 12)]
+            clock.now.side_effect = [datetime(2026, 9, 22, 11, 59, 29)] + [datetime(2026, 9, 22, 12)] * 4
             bot.poll_dates(["2026-09-27"], [], {}, wait_for_noon=True)
         self.assertEqual(self.session.get.call_count, 3)
         self.session.post.assert_called_once()
@@ -295,6 +297,41 @@ class BotTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "倒數中斷"):
                 bot.poll_dates(["2026-09-27"], [], {}, wait_for_noon=True)
         self.session.post.assert_not_called()
+
+    def test_all_timeouts_fail_instead_of_reporting_no_events(self):
+        self.session.get.side_effect = requests.ReadTimeout("read timeout")
+        with self.assertRaisesRegex(RuntimeError, "2026-09-27"):
+            bot.poll_dates(["2026-09-27"], [], {})
+        self.assertEqual(self.session.get.call_count, 3)
+        self.session.post.assert_not_called()
+        messages = "\n".join(str(call.args[0]) for call in self.log.call_args_list)
+        self.assertIn("所有查詢均失敗", messages)
+        self.assertNotIn("未找到符合", messages)
+
+    def test_valid_empty_response_is_not_query_failure(self):
+        self.session.get.return_value = response({"events": []})
+        self.assertEqual(bot.poll_dates(["2026-09-27"], [], {}), set())
+        self.session.post.assert_not_called()
+        self.log.assert_any_call("❌ 未找到符合松山/西松場地的歡樂分組。")
+
+    def test_http_or_schema_errors_are_not_valid_empty_responses(self):
+        for result in (response(status=503), response({"error": "unauthorized"}), response(None)):
+            with self.subTest(result=result):
+                self.session.get.return_value = result
+                with self.assertRaises(RuntimeError):
+                    bot.poll_dates(["2026-09-27"], [], {})
+        self.session.post.assert_not_called()
+
+    def test_failed_date_does_not_prevent_other_date_registration(self):
+        def get(url, **kwargs):
+            if "2026-09-27" in url:
+                raise requests.ReadTimeout()
+            return response([event("monday")])
+
+        self.session.get.side_effect = get
+        with self.assertRaisesRegex(RuntimeError, "2026-09-27"):
+            bot.poll_dates(["2026-09-27", "2026-09-28"], [], {})
+        self.session.post.assert_called_once()
 
 
 if __name__ == "__main__":
