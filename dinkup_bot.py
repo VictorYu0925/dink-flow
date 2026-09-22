@@ -1,14 +1,36 @@
+import json
 import os
 import time
-import json
-import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from threading import Lock
+
+import requests
 from playwright.sync_api import sync_playwright
 
 # API 的場地名稱可能是「松0高中」或「西松0中」，不一定包含完整地名。
 TARGET_LOCATION_KEYWORDS = ("松",)
 MAX_EVENT_FETCH_ATTEMPTS = 3
 API_RETRY_DELAY_SECONDS = 1
+MAX_DATE_WORKERS = 3
+
+
+def get_target_day_offsets():
+    """預設查詢 5、6 天後；拒絕空值、非整數與非未來日期。"""
+    raw = os.environ.get("TARGET_DAY_OFFSETS", "5,6")
+    try:
+        offsets = tuple(dict.fromkeys(int(value.strip()) for value in raw.split(",")))
+        if any(offset < 1 or offset > 365 for offset in offsets):
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("TARGET_DAY_OFFSETS 必須是 1～365 的逗號分隔整數，例如 5,6") from exc
+    return offsets
+
+
+def get_target_dates(day_offsets, now=None):
+    today = (now or datetime.now()).date()
+    return [(today + timedelta(days=offset)).isoformat() for offset in day_offsets]
+
 
 def wait_until_target_time(target_hour=12, target_minute=0, target_second=0):
     """毫秒級倒數等待至 12:00:00"""
@@ -29,143 +51,139 @@ def wait_until_target_time(target_hour=12, target_minute=0, target_second=0):
         elif remaining > 2:
             time.sleep(0.5)
         else:
-            time.sleep(0.001)  # 最後 2 秒進入高頻迴圈
+            time.sleep(0.001)
 
-def run():
-    # 1. 動態計算 6 天後的目標日期
-    target_date_dt = datetime.now() + timedelta(days=6)
-    target_date_iso = target_date_dt.strftime("%Y-%m-%d")
-    print(f"🎯 計算目標預約日期（6天後）：{target_date_iso}")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+def select_registrations(data):
+    events = data if isinstance(data, list) else data.get("events", [])
+    if not isinstance(events, list):
+        raise ValueError("活動清單不是陣列")
+    registrations = []
+    for event in events:
+        try:
+            location = str(event.get("location", ""))
+            if not any(keyword in location for keyword in TARGET_LOCATION_KEYWORDS):
+                continue
+            if event.get("id") is None:
+                continue
+            for division in event.get("divisions", []):
+                if (
+                    str(division.get("level", "")).lower() == "fun"
+                    and int(division.get("courtCount", 0) or 0) > 0
+                    and division.get("id") is not None
+                ):
+                    registrations.append({
+                        "event_id": event["id"],
+                        "division_id": division["id"],
+                        "title": str(event.get("title", "")),
+                        "location": location,
+                    })
+                    break
+        except (AttributeError, TypeError, ValueError):
+            print("⚠️ 跳過格式異常的活動。")
+    return registrations
 
-        # 優先從 GitHub Secrets (環境變數) 讀取；若沒有則讀取本地 auth.json
-        auth_env = os.environ.get("AUTH_JSON_CONTENT")
-        if auth_env:
-            print("🔑 使用 GitHub Secrets 進行身分驗證")
-            auth_data = json.loads(auth_env)
-            context = browser.new_context(storage_state=auth_data)
-        elif os.path.exists("auth.json"):
-            print("🔑 使用本地 auth.json 進行身分驗證")
-            context = browser.new_context(storage_state="auth.json")
+
+def register_once(session, headers, registration, attempted, lock, target_date):
+    key = (registration["event_id"], registration["division_id"])
+    # 送出前就標記；即使逾時或回應失敗，也不盲目重送有副作用的 POST。
+    with lock:
+        if key in attempted:
+            return
+        attempted.add(key)
+
+    payload = {
+        "displayName": "Victor",
+        "needsPaddle": False,
+        "count": 2,
+        "divisionId": registration["division_id"],
+    }
+    url = f"https://dinkup.club/api/events/{registration['event_id']}/registrations?club=xinyi"
+    print(f"⚡ [{target_date}] 報名：{registration['title']} | {registration['location']}")
+    try:
+        response = session.post(url, json=payload, headers=headers, timeout=5)
+        if response.status_code in (200, 201):
+            print(f"✅ [{target_date}] 報名成功：{registration['title']}")
         else:
-            raise FileNotFoundError("❌ 找不到認證資料！請設定 AUTH_JSON_CONTENT 或提供 auth.json 檔案。")
-        
-        # 2. 提取 Session Cookies 轉給 requests
-        playwright_cookies = context.cookies()
-        session = requests.Session()
-        for cookie in playwright_cookies:
-            session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'], path=cookie['path'])
+            print(f"❌ [{target_date}] 報名失敗：HTTP {response.status_code} | {response.text}")
+    except requests.RequestException as exc:
+        print(f"⚠️ [{target_date}] 報名結果不明，不自動重送，請確認網站報名狀態：{exc}")
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Content-Type": "application/json",
-            "Origin": "https://dinkup.club",
-            "Referer": "https://dinkup.club/xinyi"
-        }
 
-        # 3. 精準倒數至 12:00:00
-        wait_until_target_time(12, 0, 0)
-
-        # 4. 極速輪詢撈取 Event ID 與 Division ID
-        events_url = f"https://dinkup.club/api/events?club=xinyi&date={target_date_iso}"
-        target_registrations = []
-
-        print("🔄 正在向 API 獲取開放場次...")
+def poll_date(target_date, cookies, headers, attempted, lock):
+    # 每個日期使用自己的 Session，避免執行緒共用可變的 cookie / 連線狀態。
+    with requests.Session() as session:
+        for cookie in cookies:
+            session.cookies.set(
+                cookie["name"], cookie["value"], domain=cookie["domain"], path=cookie["path"]
+            )
+        events_url = f"https://dinkup.club/api/events?club=xinyi&date={target_date}"
         for attempt in range(1, MAX_EVENT_FETCH_ATTEMPTS + 1):
+            registrations = []
             try:
-                res = session.get(events_url, headers=headers, timeout=2)
-                if attempt == 1 or attempt == MAX_EVENT_FETCH_ATTEMPTS:
-                    print(f"🔎 活動清單 GET 第 {attempt}/{MAX_EVENT_FETCH_ATTEMPTS} 次：HTTP {res.status_code}")
-                if res.status_code == 200:
-                    data = res.json()
-                    events = data if isinstance(data, list) else data.get("events", [])
-                    matching_events = 0
-                    target_registrations = []
-                    
-                    if len(events) > 0:
-                        for ev in events:
-                            event_title = str(ev.get("title", ""))
-                            event_location = str(ev.get("location", ""))
-
-                            # 只比對場地欄位，避免其他活動在標題備註「松山站旁」而誤命中。
-                            if not any(keyword in event_location for keyword in TARGET_LOCATION_KEYWORDS):
-                                continue
-
-                            matching_events += 1
-                            divisions = ev.get("divisions", [])
-
-                            for div in divisions:
-                                # 必須是有實際球場的 fun，避免選到前台不顯示的隱藏分組。
-                                if (
-                                    str(div.get("level", "")).lower() == "fun"
-                                    and int(div.get("courtCount", 0) or 0) > 0
-                                ):
-                                    target_registrations.append({
-                                        "event_id": ev.get("id"),
-                                        "division_id": div.get("id"),
-                                        "title": event_title,
-                                        "location": event_location,
-                                    })
-                                    print(f"📍 找到目標場地：{event_title} | {event_location}")
-                                    break
-                                elif str(div.get("level", "")).lower() == "fun":
-                                    print(
-                                        f"⏭️ 跳過前台未顯示的 fun：{event_title} | "
-                                        f"courtCount={div.get('courtCount', 0)}"
-                                    )
-                        
-                        if target_registrations:
-                            print(f"🔥 [第 {attempt} 次嘗試] 找到 {len(target_registrations)} 個符合的歡樂場次。")
-                            break
-                        elif attempt == 1 or attempt % 5 == 0:
-                            print(f"ℹ️ 共 {len(events)} 個場次，符合松山/西松場地 {matching_events} 個，但尚未找到 fun 分組。")
+                response = session.get(events_url, headers=headers, timeout=2)
+                print(f"🔎 [{target_date}] GET {attempt}/{MAX_EVENT_FETCH_ATTEMPTS}：HTTP {response.status_code}")
+                if response.status_code == 200:
+                    registrations = select_registrations(response.json())
             except requests.RequestException as exc:
-                print(f"⚠️ API 第 {attempt} 次連線失敗：{exc}")
-            except Exception:
-                print(f"⚠️ API 第 {attempt} 次回應格式無法處理。")
+                print(f"⚠️ [{target_date}] 查詢失敗：{exc}")
+            except (AttributeError, TypeError, ValueError):
+                print(f"⚠️ [{target_date}] API 回應格式無法處理。")
 
+            # 找到就報名，不等待其他日期；完成報名後仍查詢，捕捉同日稍晚上架的場次。
+            for registration in registrations:
+                register_once(session, headers, registration, attempted, lock, target_date)
             if attempt < MAX_EVENT_FETCH_ATTEMPTS:
                 time.sleep(API_RETRY_DELAY_SECONDS)
 
-        # 5. 逐一報名所有符合條件的歡樂場次 (+2 人)
-        if target_registrations:
-            payload = {
-                "displayName": "Victor",
-                "needsPaddle": False,
-                "count": 2
+
+def poll_dates(target_dates, cookies, headers):
+    target_dates = list(dict.fromkeys(target_dates))
+    attempted = set()
+    lock = Lock()
+    if not target_dates:
+        return attempted
+    with ThreadPoolExecutor(max_workers=min(MAX_DATE_WORKERS, len(target_dates))) as executor:
+        futures = [
+            executor.submit(poll_date, target_date, cookies, headers, attempted, lock)
+            for target_date in target_dates
+        ]
+        for future in as_completed(futures):
+            future.result()
+    if not attempted:
+        print("❌ 未找到符合松山/西松場地的歡樂分組。")
+    return attempted
+
+
+def run():
+    day_offsets = get_target_day_offsets()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            auth_env = os.environ.get("AUTH_JSON_CONTENT")
+            if auth_env:
+                print("🔑 使用 GitHub Secrets 進行身分驗證")
+                context = browser.new_context(storage_state=json.loads(auth_env))
+            elif os.path.exists("auth.json"):
+                print("🔑 使用本地 auth.json 進行身分驗證")
+                context = browser.new_context(storage_state="auth.json")
+            else:
+                raise FileNotFoundError("❌ 找不到認證資料！請設定 AUTH_JSON_CONTENT 或提供 auth.json 檔案。")
+
+            cookies = context.cookies()
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Content-Type": "application/json",
+                "Origin": "https://dinkup.club",
+                "Referer": "https://dinkup.club/xinyi",
             }
+            wait_until_target_time(12, 0, 0)
+            target_dates = get_target_dates(day_offsets)
+            print(f"🎯 目標預約日期：{', '.join(target_dates)}")
+            poll_dates(target_dates, cookies, headers)
+        finally:
+            browser.close()
 
-            for index, registration in enumerate(target_registrations, start=1):
-                event_id = registration["event_id"]
-                division_id = registration["division_id"]
-                register_url = f"https://dinkup.club/api/events/{event_id}/registrations?club=xinyi"
-                registration_payload = {**payload, "divisionId": division_id}
-
-                print(
-                    f"⚡ 正在報名第 {index}/{len(target_registrations)} 場："
-                    f"{registration['title']} | {registration['location']}"
-                )
-                try:
-                    reg_res = session.post(
-                        register_url,
-                        json=registration_payload,
-                        headers=headers,
-                        timeout=5,
-                    )
-                    print(f"📩 回應狀態碼：{reg_res.status_code} | {reg_res.text}")
-
-                    if reg_res.status_code in [200, 201]:
-                        print("✅ 報名成功")
-                    else:
-                        print(f"❌ 報名失敗，回應碼: {reg_res.status_code}")
-                except requests.RequestException as exc:
-                    print(f"❌ 報名請求失敗：{exc}")
-        else:
-            print("\n❌ 未找到符合松山/西松場地的歡樂分組。")
-
-        browser.close()
 
 if __name__ == "__main__":
     run()

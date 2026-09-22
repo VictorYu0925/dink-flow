@@ -31,5 +31,6 @@ jobs:
           AUTH_JSON_CONTENT: ${{ secrets.AUTH_JSON_CONTENT }}
           PYTHONUNBUFFERED: "1" # 👈 新增這行，讓 log 即時印出
           TZ: "Asia/Taipei" # 👈 新增這行，將 runner 的系統時區改為台灣
+          TARGET_DAY_OFFSETS: ${{ vars.TARGET_DAY_OFFSETS || '5,6' }}
         run: |
           python -m pipenv run python dinkup_bot.py
