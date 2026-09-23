@@ -312,7 +312,37 @@ class BotTests(unittest.TestCase):
         self.session.get.return_value = response({"events": []})
         self.assertEqual(bot.poll_dates(["2026-09-27"], [], {}), set())
         self.session.post.assert_not_called()
-        self.log.assert_any_call("❌ 未找到符合松山/西松場地的歡樂分組。")
+        self.log.assert_any_call("❌ 未找到符合松山/西松場地的競技或歡樂分組。")
+
+    def test_competitive_preferred_regardless_of_api_order(self):
+        fun = {"id": "fun", "level": "fun", "courtCount": 1}
+        competitive = {"id": "comp", "level": " Competitive ", "courtCount": 1}
+        for divisions in ([fun, competitive], [competitive, fun]):
+            with self.subTest(divisions=divisions):
+                selected = bot.select_registrations([event(divisions=divisions)])
+                self.assertEqual(len(selected), 1)
+                self.assertEqual(selected[0]["division_id"], "comp")
+
+    def test_invalid_competitive_falls_back_to_fun(self):
+        fun = {"id": "fun", "level": "fun", "courtCount": 1}
+        for competitive in (
+            {"id": "comp", "level": "competitive", "courtCount": 0},
+            {"id": None, "level": "competitive", "courtCount": 1},
+            {"id": "comp", "level": "competitive", "courtCount": "invalid"},
+        ):
+            with self.subTest(competitive=competitive):
+                selected = bot.select_registrations([event(divisions=[competitive, fun])])
+                self.assertEqual(selected[0]["division_id"], "fun")
+
+    def test_competitive_payload_and_no_switch_during_followup(self):
+        competitive = event(divisions=[{"id": "comp", "level": "competitive", "courtCount": 1}])
+        for first, second in ((competitive, event()), (event(), competitive)):
+            with self.subTest(first=first):
+                self.session.reset_mock()
+                self.session.get.side_effect = [response([first]), response([second]), response([second])]
+                self.poll()
+                self.session.post.assert_called_once()
+                self.assertEqual(self.session.post.call_args.kwargs["json"]["divisionId"], first["divisions"][0]["id"])
 
     def test_http_or_schema_errors_are_not_valid_empty_responses(self):
         for result in (response(status=503), response({"error": "unauthorized"}), response(None)):
@@ -332,6 +362,78 @@ class BotTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "2026-09-27"):
             bot.poll_dates(["2026-09-27", "2026-09-28"], [], {})
         self.session.post.assert_called_once()
+
+    def fallback_event(self, **competitive_fields):
+        return event(divisions=[
+            {"id": "comp", "level": "competitive", "courtCount": 1, **competitive_fields},
+            {"id": "fun", "level": "fun", "courtCount": 1},
+        ])
+
+    def test_competitive_full_or_one_place_left_selects_fun(self):
+        for fields in (
+            {"capacity": 8, "confirmedCount": 8},
+            {"capacity": 8, "confirmedCount": 7},
+            {"capacity": 2, "confirmed": [{}]},
+        ):
+            with self.subTest(fields=fields):
+                selected = bot.select_registrations([self.fallback_event(**fields)])
+                self.assertEqual(selected[0]["division_id"], "fun")
+
+    def test_unknown_capacity_or_two_free_places_still_prefers_competitive(self):
+        for fields in ({}, {"capacity": 8}, {"capacity": 8, "confirmedCount": 6}):
+            with self.subTest(fields=fields):
+                selected = bot.select_registrations([self.fallback_event(**fields)])
+                self.assertEqual(selected[0]["division_id"], "comp")
+                self.assertEqual(selected[0]["fallback"]["division_id"], "fun")
+
+    def test_explicit_rejection_falls_back_once_without_extra_get(self):
+        for status in (400, 403, 404, 409, 422):
+            with self.subTest(status=status):
+                self.session.reset_mock()
+                self.session.get.return_value = response([self.fallback_event()])
+                self.session.post.side_effect = [response({"error": "名額已滿"}, status), response(status=201)]
+                attempted = self.poll()
+                self.assertEqual(attempted, {("event-1", "comp"), ("event-1", "fun")})
+                self.assertEqual(self.session.get.call_count, 3)
+                self.assertEqual([c.kwargs["json"]["divisionId"] for c in self.session.post.call_args_list], ["comp", "fun"])
+                self.assertTrue(all(c.kwargs["json"]["count"] == 2 for c in self.session.post.call_args_list))
+
+    def test_fun_rejection_or_timeout_stops_after_two_posts(self):
+        for fallback_result in (response({"error": "名額已滿"}, 409), requests.Timeout()):
+            with self.subTest(fallback_result=fallback_result):
+                self.session.reset_mock()
+                self.session.get.return_value = response([self.fallback_event()])
+                self.session.post.side_effect = [response({"error": "名額已滿"}, 409), fallback_result]
+                self.poll()
+                self.assertEqual(self.session.post.call_count, 2)
+
+    def test_accepted_or_uncertain_competitive_never_falls_back(self):
+        for result in (
+            response(status=201), response({"snapshot": {"waitlisted": [{}]}}, 200),
+            requests.Timeout(), requests.ConnectionError(),
+            response({"error": "server error"}, 500), response({"error": "timeout"}, 408),
+            response({"error": "unauthorized"}, 401), response({"error": "rate limit"}, 429),
+            response({"error": "已報名此活動"}, 409), response({"error": "Already registered"}, 400),
+            response({"error": "已進入候補"}, 409), response(status=400),
+        ):
+            with self.subTest(result=result):
+                self.session.reset_mock()
+                self.session.get.return_value = response([self.fallback_event()])
+                self.session.post.side_effect = [result]
+                self.poll()
+                self.session.post.assert_called_once()
+
+    def test_fallback_is_not_duplicated_across_concurrent_dates(self):
+        barrier = Barrier(2)
+
+        def get(*args, **kwargs):
+            barrier.wait(timeout=3)
+            return response([self.fallback_event()])
+
+        self.session.get.side_effect = get
+        self.session.post.side_effect = [response({"error": "名額已滿"}, 409), response(status=201)]
+        bot.poll_dates(["2026-09-27", "2026-09-28"], [], {})
+        self.assertEqual(self.session.post.call_count, 2)
 
 
 if __name__ == "__main__":

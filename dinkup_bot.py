@@ -10,6 +10,9 @@ from playwright.sync_api import sync_playwright
 
 # API 的場地名稱可能是「松0高中」或「西松0中」，不一定包含完整地名。
 TARGET_LOCATION_KEYWORDS = ("松",)
+DIVISION_PRIORITY = ("competitive", "fun")
+DIVISION_LABELS = {"competitive": "競技", "fun": "歡樂"}
+REGISTRATION_COUNT = 2
 MAX_EVENT_FETCH_ATTEMPTS = 3
 API_RETRY_DELAY_SECONDS = 1
 MAX_DATE_WORKERS = 3
@@ -61,6 +64,21 @@ def wait_until_target_time(target_hour=12, target_minute=0, target_second=0, on_
             time.sleep(0.001)
 
 
+def lacks_confirmed_places(division):
+    """只有容量及人數皆可核實時，才判斷正取名額不足。"""
+    try:
+        capacity = int(division["capacity"])
+        if division.get("confirmedCount") is not None:
+            confirmed = int(division["confirmedCount"])
+        elif isinstance(division.get("confirmed"), list):
+            confirmed = len(division["confirmed"])
+        else:
+            return False
+        return capacity >= 0 and confirmed >= 0 and capacity - confirmed < REGISTRATION_COUNT
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def select_registrations(data):
     events = data if isinstance(data, list) else data["events"]
     if not isinstance(events, list):
@@ -73,48 +91,98 @@ def select_registrations(data):
                 continue
             if event.get("id") is None:
                 continue
+            candidates = {}
             for division in event.get("divisions", []):
-                if (
-                    str(division.get("level", "")).lower() == "fun"
-                    and int(division.get("courtCount", 0) or 0) > 0
-                    and division.get("id") is not None
-                ):
-                    registrations.append({
-                        "event_id": event["id"],
-                        "division_id": division["id"],
-                        "title": str(event.get("title", "")),
-                        "location": location,
-                    })
-                    break
+                try:
+                    level = str(division.get("level", "")).strip().lower()
+                    if (
+                        level in DIVISION_PRIORITY
+                        and int(division.get("courtCount", 0) or 0) > 0
+                        and division.get("id") is not None
+                    ):
+                        candidates.setdefault(level, division)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+            for level in DIVISION_PRIORITY:
+                if level not in candidates:
+                    continue
+                registration = {
+                    "event_id": event["id"],
+                    "division_id": candidates[level]["id"],
+                    "level": level,
+                    "title": str(event.get("title", "")),
+                    "location": location,
+                }
+                if level == "competitive" and "fun" in candidates:
+                    fallback = {**registration, "division_id": candidates["fun"]["id"], "level": "fun"}
+                    if lacks_confirmed_places(candidates[level]):
+                        print(f"↪️ {registration['title']} 競技正取名額不足 {REGISTRATION_COUNT} 人，改選歡樂。")
+                        registration = fallback
+                    else:
+                        registration["fallback"] = fallback
+                registrations.append(registration)
+                break
         except (AttributeError, TypeError, ValueError):
             print("⚠️ 跳過格式異常的活動。")
     return registrations
+
+
+def can_fallback_after_rejection(response):
+    # 5xx、逾時、非 JSON 回應都不能證明沒有建立報名。
+    if response.status_code not in (400, 403, 404, 409, 422):
+        return False
+    try:
+        data = response.json()
+    except ValueError:
+        return False
+    error = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(error, str) or not error.strip():
+        return False
+    # 已有報名不是改報的依據，避免跨執行或候補造成重複。
+    return not any(word in error.lower() for word in (
+        "already", "duplicate", "已報名", "已經報名", "已報過", "重複", "候補", "備取", "waitlist",
+    ))
 
 
 def register_once(session, headers, registration, attempted, lock, target_date):
     key = (registration["event_id"], registration["division_id"])
     # 送出前就標記；即使逾時或回應失敗，也不盲目重送有副作用的 POST。
     with lock:
-        if key in attempted:
+        if any(event_id == registration["event_id"] for event_id, _ in attempted):
             return
         attempted.add(key)
 
     payload = {
         "displayName": "Victor",
         "needsPaddle": False,
-        "count": 2,
+        "count": REGISTRATION_COUNT,
         "divisionId": registration["division_id"],
     }
     url = f"https://dinkup.club/api/events/{registration['event_id']}/registrations?club=xinyi"
-    print(f"⚡ [{target_date}] 報名：{registration['title']} | {registration['location']}")
-    try:
-        response = session.post(url, json=payload, headers=headers, timeout=5)
-        if response.status_code in (200, 201):
-            print(f"✅ [{target_date}] 報名成功：{registration['title']}")
-        else:
-            print(f"❌ [{target_date}] 報名失敗：HTTP {response.status_code} | {response.text}")
-    except requests.RequestException as exc:
-        print(f"⚠️ [{target_date}] 報名結果不明，不自動重送，請確認網站報名狀態：{exc}")
+    choices = [registration]
+    fallback = registration.get("fallback")
+    if fallback is not None and fallback["division_id"] != registration["division_id"]:
+        choices.append(fallback)
+    for index, choice in enumerate(choices):
+        if index:
+            with lock:
+                attempted.add((choice["event_id"], choice["division_id"]))
+            print(f"↪️ [{target_date}] 競技明確拒絕，改報歡樂一次。")
+        payload["divisionId"] = choice["division_id"]
+        division_label = DIVISION_LABELS[choice["level"]]
+        print(f"⚡ [{target_date}] 報名{division_label}：{choice['title']} | {choice['location']}")
+        try:
+            response = session.post(url, json=dict(payload), headers=headers, timeout=5)
+            if response.status_code in (200, 201):
+                print(f"✅ [{target_date}] {division_label}報名已受理（正取／候補請確認網站）：{choice['title']}")
+                return
+            print(f"❌ [{target_date}] {division_label}報名失敗：HTTP {response.status_code} | {response.text}")
+            if not can_fallback_after_rejection(response):
+                print(f"⚠️ [{target_date}] 不符合安全改報條件，請確認網站報名狀態。")
+                return
+        except requests.RequestException as exc:
+            print(f"⚠️ [{target_date}] 報名結果不明，不自動重送或改報，請確認網站報名狀態：{exc}")
+            return
 
 
 def poll_date(target_date, cookies, headers, attempted, lock, start_event=None, cancelled=None):
@@ -214,7 +282,7 @@ def poll_dates(target_dates, cookies, headers, wait_for_noon=False):
     if failed_dates:
         raise RuntimeError(f"以下日期未取得任何有效活動資料，請檢查查詢日誌：{', '.join(sorted(failed_dates))}")
     if not attempted:
-        print("❌ 未找到符合松山/西松場地的歡樂分組。")
+        print("❌ 未找到符合松山/西松場地的競技或歡樂分組。")
     return attempted
 
 
