@@ -15,7 +15,7 @@ def event(event_id="event-1", location="松山高中", divisions=None):
         "title": "松山站旁歡樂場",
         "location": location,
         "divisions": divisions if divisions is not None else [
-            {"id": "fun-1", "level": "fun", "courtCount": 1}
+            {"id": "fun-1", "level": "fun", "label": "歡樂", "courtCount": 1}
         ],
     }
 
@@ -40,12 +40,20 @@ class BotTests(unittest.TestCase):
         bot.poll_date("2026-09-27", [], {}, attempted, Lock())
         return attempted
 
-    def test_default_dates_cover_sunday_and_monday(self):
+    def test_default_dates_cover_four_to_six_days_ahead(self):
         with patch.dict(bot.os.environ, {}, clear=True):
             offsets = bot.get_target_day_offsets()
         self.assertEqual(
             bot.get_target_dates(offsets, datetime(2026, 9, 22)),
-            ["2026-09-27", "2026-09-28"],
+            ["2026-09-26", "2026-09-27", "2026-09-28"],
+        )
+
+    def test_wednesday_queries_sunday_opening(self):
+        with patch.dict(bot.os.environ, {}, clear=True):
+            offsets = bot.get_target_day_offsets()
+        self.assertEqual(
+            bot.get_target_dates(offsets, datetime(2026, 9, 30, 12)),
+            ["2026-10-04", "2026-10-05", "2026-10-06"],
         )
 
     def test_custom_offsets_deduplicate_and_cross_year(self):
@@ -65,9 +73,9 @@ class BotTests(unittest.TestCase):
 
     def test_location_and_visible_fun_filtering(self):
         divisions = [
-            {"id": "hidden", "level": "fun", "courtCount": 0},
+            {"id": "hidden", "level": "fun", "label": "歡樂", "courtCount": 0},
             {"id": "pro", "level": "pro", "courtCount": 2},
-            {"id": "visible", "level": "FUN", "courtCount": "1"},
+            {"id": "visible", "level": "FUN", "label": "歡樂", "courtCount": "1"},
         ]
         selected = bot.select_registrations({"events": [
             None, event("wrong-location", "其他體育館"),
@@ -75,6 +83,42 @@ class BotTests(unittest.TestCase):
             event(None), event("valid", "西松高中", divisions),
         ]})
         self.assertEqual([(r["event_id"], r["division_id"]) for r in selected], [("valid", "visible")])
+
+    def test_coached_competitive_slot_registers_fun_instead(self):
+        self.session.get.return_value = response([event(divisions=[
+            {"id": "lesson", "level": "competitive", "courtCount": 1,
+             "label": "新手進階班（有教練）針對比賽情境練", "capacity": 6, "confirmedCount": 1},
+            {"id": "fun", "level": "fun", "label": "歡樂", "courtCount": 3},
+        ])])
+        self.assertEqual(self.poll(), {("event-1", "fun")})
+        self.session.post.assert_called_once()
+        self.assertEqual(self.session.post.call_args.kwargs["json"]["divisionId"], "fun")
+
+    def test_label_overrides_api_level_and_preserves_fallback(self):
+        selected = bot.select_registrations([event(divisions=[
+            {"id": "fun", "level": "competitive", "label": "歡樂場雙打[懂規則]", "courtCount": 1},
+            {"id": "comp", "level": "beginner", "label": "競技球敘3.0UP", "courtCount": 1},
+        ])])
+        self.assertEqual(selected[0]["division_id"], "comp")
+        self.assertEqual(selected[0]["level"], "competitive")
+        self.assertEqual(selected[0]["fallback"]["division_id"], "fun")
+
+    def test_lessons_and_unknown_labels_are_skipped(self):
+        for label in (None, "", "  ", 123, "自由練習", "競技／歡樂",
+                      "競技教練課", "歡樂課程", "競技教學", "歡樂體驗班",
+                      "競技進階班", "歡樂基礎班", "競技訓練班"):
+            with self.subTest(label=label):
+                self.assertEqual(bot.select_registrations([event(divisions=[
+                    {"id": "skip", "level": "competitive", "label": label, "courtCount": 1},
+                ])]), [])
+        self.assertEqual(bot.select_registrations([event(divisions=[
+            {"id": "missing-label", "level": "fun", "courtCount": 1},
+        ])]), [])
+
+    def test_event_notes_do_not_exclude_social_division(self):
+        data = event()
+        data["notes"] = "教練課程詢問"
+        self.assertEqual(bot.select_registrations([data])[0]["division_id"], "fun-1")
 
     def test_late_events_same_day_and_payload(self):
         self.session.get.side_effect = [
@@ -315,8 +359,8 @@ class BotTests(unittest.TestCase):
         self.log.assert_any_call("❌ 未找到符合松山/西松場地的競技或歡樂分組。")
 
     def test_competitive_preferred_regardless_of_api_order(self):
-        fun = {"id": "fun", "level": "fun", "courtCount": 1}
-        competitive = {"id": "comp", "level": " Competitive ", "courtCount": 1}
+        fun = {"id": "fun", "level": "fun", "label": "歡樂", "courtCount": 1}
+        competitive = {"id": "comp", "level": " Competitive ", "label": "競技", "courtCount": 1}
         for divisions in ([fun, competitive], [competitive, fun]):
             with self.subTest(divisions=divisions):
                 selected = bot.select_registrations([event(divisions=divisions)])
@@ -324,18 +368,18 @@ class BotTests(unittest.TestCase):
                 self.assertEqual(selected[0]["division_id"], "comp")
 
     def test_invalid_competitive_falls_back_to_fun(self):
-        fun = {"id": "fun", "level": "fun", "courtCount": 1}
+        fun = {"id": "fun", "level": "fun", "label": "歡樂", "courtCount": 1}
         for competitive in (
-            {"id": "comp", "level": "competitive", "courtCount": 0},
-            {"id": None, "level": "competitive", "courtCount": 1},
-            {"id": "comp", "level": "competitive", "courtCount": "invalid"},
+            {"id": "comp", "level": "competitive", "label": "競技", "courtCount": 0},
+            {"id": None, "level": "competitive", "label": "競技", "courtCount": 1},
+            {"id": "comp", "level": "competitive", "label": "競技", "courtCount": "invalid"},
         ):
             with self.subTest(competitive=competitive):
                 selected = bot.select_registrations([event(divisions=[competitive, fun])])
                 self.assertEqual(selected[0]["division_id"], "fun")
 
     def test_competitive_payload_and_no_switch_during_followup(self):
-        competitive = event(divisions=[{"id": "comp", "level": "competitive", "courtCount": 1}])
+        competitive = event(divisions=[{"id": "comp", "level": "competitive", "label": "競技", "courtCount": 1}])
         for first, second in ((competitive, event()), (event(), competitive)):
             with self.subTest(first=first):
                 self.session.reset_mock()
@@ -365,8 +409,8 @@ class BotTests(unittest.TestCase):
 
     def fallback_event(self, **competitive_fields):
         return event(divisions=[
-            {"id": "comp", "level": "competitive", "courtCount": 1, **competitive_fields},
-            {"id": "fun", "level": "fun", "courtCount": 1},
+            {"id": "comp", "level": "competitive", "label": "競技", "courtCount": 1, **competitive_fields},
+            {"id": "fun", "level": "fun", "label": "歡樂", "courtCount": 1},
         ])
 
     def test_competitive_full_or_one_place_left_selects_fun(self):

@@ -12,6 +12,7 @@ from playwright.sync_api import sync_playwright
 TARGET_LOCATION_KEYWORDS = ("松",)
 DIVISION_PRIORITY = ("competitive", "fun")
 DIVISION_LABELS = {"competitive": "競技", "fun": "歡樂"}
+LESSON_LABEL_KEYWORDS = ("教練", "課程", "教學", "體驗班", "進階班", "基礎班", "訓練班")
 REGISTRATION_COUNT = 2
 MAX_EVENT_FETCH_ATTEMPTS = 3
 API_RETRY_DELAY_SECONDS = 1
@@ -22,14 +23,14 @@ EVENT_GET_TIMEOUT = (5, 10)
 
 
 def get_target_day_offsets():
-    """預設查詢 5、6 天後；拒絕空值、非整數與非未來日期。"""
-    raw = os.environ.get("TARGET_DAY_OFFSETS", "5,6")
+    """預設查詢 4、5、6 天後，涵蓋週三開放週日場次。"""
+    raw = os.environ.get("TARGET_DAY_OFFSETS", "4,5,6")
     try:
         offsets = tuple(dict.fromkeys(int(value.strip()) for value in raw.split(",")))
         if any(offset < 1 or offset > 365 for offset in offsets):
             raise ValueError
     except ValueError as exc:
-        raise ValueError("TARGET_DAY_OFFSETS 必須是 1～365 的逗號分隔整數，例如 5,6") from exc
+        raise ValueError("TARGET_DAY_OFFSETS 必須是 1～365 的逗號分隔整數，例如 4,5,6") from exc
     return offsets
 
 
@@ -79,6 +80,18 @@ def lacks_confirmed_places(division):
         return False
 
 
+def classify_division(division):
+    """依組別名稱辨識球敘；API level 可能被沿用於教練課。"""
+    label = division.get("label")
+    if not isinstance(label, str) or not label.strip():
+        return None
+    if any(keyword in label for keyword in LESSON_LABEL_KEYWORDS):
+        return None
+    matches = [level for level in DIVISION_PRIORITY if DIVISION_LABELS[level] in label]
+    # 缺少明確名稱或同時標示競技／歡樂時，不猜測組別用途。
+    return matches[0] if len(matches) == 1 else None
+
+
 def select_registrations(data):
     events = data if isinstance(data, list) else data["events"]
     if not isinstance(events, list):
@@ -94,7 +107,7 @@ def select_registrations(data):
             candidates = {}
             for division in event.get("divisions", []):
                 try:
-                    level = str(division.get("level", "")).strip().lower()
+                    level = classify_division(division)
                     if (
                         level in DIVISION_PRIORITY
                         and int(division.get("courtCount", 0) or 0) > 0
