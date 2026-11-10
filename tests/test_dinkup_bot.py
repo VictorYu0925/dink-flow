@@ -21,6 +21,11 @@ def event(event_id="event-1", location="松山高中", divisions=None):
 
 
 def response(data=None, status=200):
+    if data is None and status == 201:
+        data = {"snapshot": {"divisions": [
+            {"id": division_id, "confirmed": [{"isMine": True}, {"isMine": True}]}
+            for division_id in ("fun-1", "fun", "comp", "competitive")
+        ]}}
     result = MagicMock(status_code=status, text="mock response")
     result.json.return_value = data
     return result
@@ -34,6 +39,7 @@ class BotTests(unittest.TestCase):
         self.session.post.return_value = response(status=201)
         self.enterContext(patch.object(bot.time, "sleep"))
         self.log = self.enterContext(patch("builtins.print"))
+        self.email = self.enterContext(patch.object(bot, "send_success_email"))
 
     def poll(self):
         attempted = set()
@@ -99,9 +105,9 @@ class BotTests(unittest.TestCase):
             {"id": "fun", "level": "competitive", "label": "歡樂場雙打[懂規則]", "courtCount": 1},
             {"id": "comp", "level": "beginner", "label": "競技球敘3.0UP", "courtCount": 1},
         ])])
-        self.assertEqual(selected[0]["division_id"], "comp")
-        self.assertEqual(selected[0]["level"], "competitive")
-        self.assertEqual(selected[0]["fallback"]["division_id"], "fun")
+        self.assertEqual(selected[0]["division_id"], "fun")
+        self.assertEqual(selected[0]["level"], "fun")
+        self.assertEqual(selected[0]["fallback"]["division_id"], "comp")
 
     def test_lessons_and_unknown_labels_are_skipped(self):
         for label in (None, "", "  ", 123, "自由練習", "競技／歡樂",
@@ -358,29 +364,29 @@ class BotTests(unittest.TestCase):
         self.session.post.assert_not_called()
         self.log.assert_any_call("❌ 未找到符合松山/西松場地的競技或歡樂分組。")
 
-    def test_competitive_preferred_regardless_of_api_order(self):
-        fun = {"id": "fun", "level": "fun", "label": "歡樂", "courtCount": 1}
-        competitive = {"id": "comp", "level": " Competitive ", "label": "競技", "courtCount": 1}
-        for divisions in ([fun, competitive], [competitive, fun]):
+    def test_fun_preferred_regardless_of_api_order(self):
+        competitive = {"id": "competitive", "level": "competitive", "label": "競技", "courtCount": 1}
+        fun = {"id": "fun", "level": " Fun ", "label": "歡樂", "courtCount": 1}
+        for divisions in ([competitive, fun], [fun, competitive]):
             with self.subTest(divisions=divisions):
                 selected = bot.select_registrations([event(divisions=divisions)])
                 self.assertEqual(len(selected), 1)
-                self.assertEqual(selected[0]["division_id"], "comp")
-
-    def test_invalid_competitive_falls_back_to_fun(self):
-        fun = {"id": "fun", "level": "fun", "label": "歡樂", "courtCount": 1}
-        for competitive in (
-            {"id": "comp", "level": "competitive", "label": "競技", "courtCount": 0},
-            {"id": None, "level": "competitive", "label": "競技", "courtCount": 1},
-            {"id": "comp", "level": "competitive", "label": "競技", "courtCount": "invalid"},
-        ):
-            with self.subTest(competitive=competitive):
-                selected = bot.select_registrations([event(divisions=[competitive, fun])])
                 self.assertEqual(selected[0]["division_id"], "fun")
 
-    def test_competitive_payload_and_no_switch_during_followup(self):
-        competitive = event(divisions=[{"id": "comp", "level": "competitive", "label": "競技", "courtCount": 1}])
-        for first, second in ((competitive, event()), (event(), competitive)):
+    def test_invalid_fun_falls_back_to_competitive(self):
+        competitive = {"id": "competitive", "level": "competitive", "label": "競技", "courtCount": 1}
+        for fun in (
+            {"id": "fun", "level": "fun", "label": "歡樂", "courtCount": 0},
+            {"id": None, "level": "fun", "label": "歡樂", "courtCount": 1},
+            {"id": "fun", "level": "fun", "label": "歡樂", "courtCount": "invalid"},
+        ):
+            with self.subTest(fun=fun):
+                selected = bot.select_registrations([event(divisions=[fun, competitive])])
+                self.assertEqual(selected[0]["division_id"], "competitive")
+
+    def test_fun_payload_and_no_switch_during_followup(self):
+        fun = event(divisions=[{"id": "fun", "level": "fun", "label": "歡樂", "courtCount": 1}])
+        for first, second in ((fun, event()), (event(), fun)):
             with self.subTest(first=first):
                 self.session.reset_mock()
                 self.session.get.side_effect = [response([first]), response([second]), response([second])]
@@ -407,13 +413,13 @@ class BotTests(unittest.TestCase):
             bot.poll_dates(["2026-09-27", "2026-09-28"], [], {})
         self.session.post.assert_called_once()
 
-    def fallback_event(self, **competitive_fields):
+    def fallback_event(self, **fun_fields):
         return event(divisions=[
-            {"id": "comp", "level": "competitive", "label": "競技", "courtCount": 1, **competitive_fields},
-            {"id": "fun", "level": "fun", "label": "歡樂", "courtCount": 1},
+            {"id": "fun", "level": "fun", "label": "歡樂", "courtCount": 1, **fun_fields},
+            {"id": "competitive", "level": "competitive", "label": "競技", "courtCount": 1},
         ])
 
-    def test_competitive_full_or_one_place_left_selects_fun(self):
+    def test_fun_full_or_one_place_left_selects_competitive(self):
         for fields in (
             {"capacity": 8, "confirmedCount": 8},
             {"capacity": 8, "confirmedCount": 7},
@@ -421,14 +427,14 @@ class BotTests(unittest.TestCase):
         ):
             with self.subTest(fields=fields):
                 selected = bot.select_registrations([self.fallback_event(**fields)])
-                self.assertEqual(selected[0]["division_id"], "fun")
+                self.assertEqual(selected[0]["division_id"], "competitive")
 
-    def test_unknown_capacity_or_two_free_places_still_prefers_competitive(self):
+    def test_unknown_capacity_or_two_free_places_still_prefers_fun(self):
         for fields in ({}, {"capacity": 8}, {"capacity": 8, "confirmedCount": 6}):
             with self.subTest(fields=fields):
                 selected = bot.select_registrations([self.fallback_event(**fields)])
-                self.assertEqual(selected[0]["division_id"], "comp")
-                self.assertEqual(selected[0]["fallback"]["division_id"], "fun")
+                self.assertEqual(selected[0]["division_id"], "fun")
+                self.assertEqual(selected[0]["fallback"]["division_id"], "competitive")
 
     def test_explicit_rejection_falls_back_once_without_extra_get(self):
         for status in (400, 403, 404, 409, 422):
@@ -437,12 +443,12 @@ class BotTests(unittest.TestCase):
                 self.session.get.return_value = response([self.fallback_event()])
                 self.session.post.side_effect = [response({"error": "名額已滿"}, status), response(status=201)]
                 attempted = self.poll()
-                self.assertEqual(attempted, {("event-1", "comp"), ("event-1", "fun")})
+                self.assertEqual(attempted, {("event-1", "fun"), ("event-1", "competitive")})
                 self.assertEqual(self.session.get.call_count, 3)
-                self.assertEqual([c.kwargs["json"]["divisionId"] for c in self.session.post.call_args_list], ["comp", "fun"])
+                self.assertEqual([c.kwargs["json"]["divisionId"] for c in self.session.post.call_args_list], ["fun", "competitive"])
                 self.assertTrue(all(c.kwargs["json"]["count"] == 2 for c in self.session.post.call_args_list))
 
-    def test_fun_rejection_or_timeout_stops_after_two_posts(self):
+    def test_competitive_rejection_or_timeout_stops_after_two_posts(self):
         for fallback_result in (response({"error": "名額已滿"}, 409), requests.Timeout()):
             with self.subTest(fallback_result=fallback_result):
                 self.session.reset_mock()
@@ -451,7 +457,7 @@ class BotTests(unittest.TestCase):
                 self.poll()
                 self.assertEqual(self.session.post.call_count, 2)
 
-    def test_accepted_or_uncertain_competitive_never_falls_back(self):
+    def test_accepted_or_uncertain_fun_never_falls_back(self):
         for result in (
             response(status=201), response({"snapshot": {"waitlisted": [{}]}}, 200),
             requests.Timeout(), requests.ConnectionError(),
@@ -478,6 +484,135 @@ class BotTests(unittest.TestCase):
         self.session.post.side_effect = [response({"error": "名額已滿"}, 409), response(status=201)]
         bot.poll_dates(["2026-09-27", "2026-09-28"], [], {})
         self.assertEqual(self.session.post.call_count, 2)
+
+    def test_two_person_limit_and_dupr_are_respected(self):
+        for fields in (
+            {"repeatRegistrationEnabled": 0},
+            {"repeatRegistrationEnabled": 1, "repeatRegistrationLimit": 1},
+        ):
+            data = {**event(), **fields}
+            self.assertEqual(bot.select_registrations([data]), [])
+        data = event()
+        data["divisions"][0]["duprEnabled"] = True
+        self.assertEqual(bot.select_registrations([data]), [])
+
+    def test_existing_registration_is_not_submitted_again(self):
+        for status in ("confirmed", "waitlisted"):
+            data = event()
+            data["myRegistrationSummary"] = [{"status": status, "count": 1}]
+            self.assertEqual(bot.select_registrations([data]), [])
+
+    def test_invalid_authentication_has_actionable_error(self):
+        self.session.get.return_value = response({"user": None})
+        with self.assertRaisesRegex(RuntimeError, "AUTH_JSON_CONTENT"):
+            bot.validate_authentication([], {})
+        self.session.post.assert_not_called()
+
+    def test_valid_authentication(self):
+        self.session.get.return_value = response({"user": {"id": "me"}})
+        bot.validate_authentication([], {})
+        self.session.get.assert_called_once()
+
+    def test_notification_contains_only_verified_success(self):
+        self.session.get.return_value = response([event()])
+        bot.poll_dates(["2026-11-15"], [], {})
+        records = self.email.call_args.args[0]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["date"], "2026-11-15")
+        self.assertEqual(records[0]["level"], "fun")
+
+    def test_unconfirmed_or_rejected_registration_fails_run(self):
+        for result in (
+            response({"snapshot": {"divisions": [
+                {"id": "fun-1", "confirmed": [{"isMine": True}, {"isMine": False}],
+                 "waitlisted": [{"isMine": True}]},
+            ]}}, 201),
+            response({"error": "login required"}, 401),
+            response({}, 200),
+        ):
+            with self.subTest(result=result):
+                self.session.reset_mock()
+                self.session.get.return_value = response([event()])
+                self.session.post.return_value = result
+                with self.assertRaises(RuntimeError):
+                    bot.poll_dates(["2026-11-15"], [], {})
+                self.session.post.assert_called_once()
+                self.assertEqual(self.email.call_args.args[0], [])
+
+    def test_mail_failure_does_not_resubmit_registration(self):
+        self.session.get.return_value = response([event()])
+        self.email.side_effect = RuntimeError("mail unavailable")
+        with self.assertRaisesRegex(RuntimeError, "mail unavailable"):
+            bot.poll_dates(["2026-11-15"], [], {})
+        self.session.post.assert_called_once()
+
+    def test_non_capacity_rejection_never_switches_division(self):
+        for error in ("尚未開放報名", "每帳號最多 1 位", "禁止報名"):
+            self.assertFalse(bot.can_fallback_after_rejection(response({"error": error}, 403)))
+
+
+class EmailTests(unittest.TestCase):
+    def setUp(self):
+        self.post = self.enterContext(patch.object(bot.requests, "post"))
+        self.post.return_value = response({"id": "email-1"})
+        self.enterContext(patch("builtins.print"))
+        self.enterContext(patch.dict(bot.os.environ, {
+            "NOTIFY_EMAIL": "recipient@example.com", "RESEND_API_KEY": "re_test_key",
+        }, clear=True))
+        self.registrations = [{"date": "2026-11-15", "title": "球敘", "location": "松山", "level": "fun"}]
+
+    def test_resend_email_content(self):
+        bot.send_success_email(self.registrations)
+        self.post.assert_called_once()
+        args, kwargs = self.post.call_args
+        self.assertEqual(args, ("https://api.resend.com/emails",))
+        self.assertEqual(kwargs["headers"], {"Authorization": "Bearer re_test_key"})
+        self.assertEqual(kwargs["timeout"], (5, 20))
+        self.assertFalse(kwargs["allow_redirects"])
+        message = kwargs["json"]
+        self.assertEqual(message["to"], ["recipient@example.com"])
+        self.assertEqual(message["from"], "DinkUp <onboarding@resend.dev>")
+        self.assertIn("2026-11-15", message["text"])
+        self.assertIn("正取：2 位", message["text"])
+        self.assertNotIn("re_test_key", str(message))
+
+    def test_custom_or_blank_sender(self):
+        for sender, expected in (("bot@example.com", "bot@example.com"), ("", "DinkUp <onboarding@resend.dev>")):
+            with patch.dict(bot.os.environ, {"RESEND_FROM": sender}):
+                bot.send_success_email(self.registrations)
+                self.assertEqual(self.post.call_args.kwargs["json"]["from"], expected)
+
+    def test_rejection_does_not_expose_response_or_retry(self):
+        for status in (302, 401, 403, 429, 500):
+            with self.subTest(status=status):
+                self.post.reset_mock()
+                self.post.return_value = response({"message": "re_test_key"}, status)
+                with self.assertRaisesRegex(RuntimeError, str(status)) as error:
+                    bot.send_success_email(self.registrations)
+                self.assertNotIn("re_test_key", str(error.exception))
+                self.post.assert_called_once()
+
+    def test_timeout_does_not_retry(self):
+        self.post.side_effect = requests.Timeout()
+        with self.assertRaises(requests.Timeout):
+            bot.send_success_email(self.registrations)
+        self.post.assert_called_once()
+
+    def test_malformed_success_is_not_reported_as_sent(self):
+        for data in ({}, [], {"id": ""}, {"id": 1}):
+            self.post.return_value = response(data)
+            with self.assertRaises(ValueError):
+                bot.send_success_email(self.registrations)
+        self.post.return_value.json.side_effect = ValueError("invalid JSON")
+        with self.assertRaises(ValueError):
+            bot.send_success_email(self.registrations)
+
+    def test_missing_settings_and_empty_results(self):
+        with patch.dict(bot.os.environ, {}, clear=True):
+            bot.send_success_email([])
+            with self.assertRaisesRegex(RuntimeError, "NOTIFY_EMAIL"):
+                bot.send_success_email(self.registrations)
+        self.post.assert_not_called()
 
 
 if __name__ == "__main__":

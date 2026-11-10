@@ -29,6 +29,9 @@ jobs:
       - name: Run DinkUp Bot Test
         env:
           AUTH_JSON_CONTENT: ${{ secrets.AUTH_JSON_CONTENT }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
           PYTHONUNBUFFERED: "1" # 👈 新增這行，讓 log 即時印出
           TZ: "Asia/Taipei" # 👈 新增這行，將 runner 的系統時區改為台灣
           TARGET_DAY_OFFSETS: ${{ vars.TARGET_DAY_OFFSETS || '4,5,6' }}
