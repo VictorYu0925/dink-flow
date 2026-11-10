@@ -33,6 +33,9 @@ jobs:
       - name: Run DinkUp Bot Schedule
         env:
           AUTH_JSON_CONTENT: ${{ secrets.AUTH_JSON_CONTENT }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
           PYTHONUNBUFFERED: "1"
           TZ: "Asia/Taipei"
           TARGET_DAY_OFFSETS: ${{ vars.TARGET_DAY_OFFSETS || '4,5,6' }}
