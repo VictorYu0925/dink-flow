@@ -173,6 +173,18 @@ def can_fallback_after_rejection(response):
     return any(word in error.lower() for word in ("名額已滿", "額滿", "名額不足", "division full"))
 
 
+def account_registration_limit_reached(response):
+    """辨識跨日排程重複送出後，API 回報本帳號可報人數已為零。"""
+    try:
+        data = response.json()
+    except ValueError:
+        return False
+    error = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(error, str):
+        return False
+    return "目前還可以報 0 位" in error or "0 registrations remaining" in error.lower()
+
+
 def validate_authentication(cookies, headers):
     with requests.Session() as session:
         for cookie in cookies:
@@ -267,6 +279,9 @@ def register_once(session, headers, registration, attempted, lock, target_date):
                 if confirmed is None:
                     print(f"⚠️ [{target_date}] 尚未核實兩位正取，不寄成功通知，請檢查候補／報名狀態。")
                 return confirmed or False
+            if account_registration_limit_reached(response):
+                print(f"ℹ️ [{target_date}] {choice['title']} 本帳號可報人數已用完，視為先前已處理，不重試或改報。")
+                return None
             print(f"❌ [{target_date}] {division_label}報名失敗：HTTP {response.status_code} | {response.text}")
             if not can_fallback_after_rejection(response):
                 print(f"⚠️ [{target_date}] 不符合安全改報條件，請確認網站報名狀態。")
