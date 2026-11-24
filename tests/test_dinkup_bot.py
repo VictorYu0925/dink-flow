@@ -550,6 +550,22 @@ class BotTests(unittest.TestCase):
         for error in ("尚未開放報名", "每帳號最多 1 位", "禁止報名"):
             self.assertFalse(bot.can_fallback_after_rejection(response({"error": error}, 403)))
 
+    def test_account_limit_already_used_is_idempotent_success(self):
+        self.session.get.return_value = response([self.fallback_event()])
+        self.session.post.return_value = response(
+            {"error": "你最多可報名 4 位（含本人），目前還可以報 0 位"}, 409
+        )
+        attempted = bot.poll_dates(["2026-11-28"], [], {})
+        self.assertEqual(attempted, {("event-1", "fun")})
+        self.session.post.assert_called_once()
+        self.assertEqual(self.session.post.call_args.kwargs["json"]["divisionId"], "fun")
+        self.email.assert_called_once_with([])
+
+    def test_zero_remaining_does_not_switch_to_competitive(self):
+        result = response({"error": "你最多可報名 2 位（含本人），目前還可以報 0 位"}, 409)
+        self.assertTrue(bot.account_registration_limit_reached(result))
+        self.assertFalse(bot.can_fallback_after_rejection(result))
+
 
 class EmailTests(unittest.TestCase):
     def setUp(self):
